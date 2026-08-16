@@ -3,13 +3,14 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api, errorMessage } from '../../api/client'
 import type { Charge, ChargeBatch } from '../../api/types'
 import { currentMonth, formatCents, formatDMY, formatMonth, formatTimestamp } from '../../lib/format'
-import { safeUrl, sanitizeCSVCell } from '../../lib/security'
+import { sanitizeCSVCell } from '../../lib/security'
 import AdminLayout from '../../components/layout/AdminLayout.vue'
 import NavIcon from '../../components/layout/NavIcon.vue'
 import Avatar from '../../components/ui/Avatar.vue'
 import Badge from '../../components/ui/Badge.vue'
 import BaseButton from '../../components/ui/BaseButton.vue'
 import Card from '../../components/ui/Card.vue'
+import Modal from '../../components/ui/Modal.vue'
 import SectionLabel from '../../components/ui/SectionLabel.vue'
 
 const batch = ref<ChargeBatch | null>(null)
@@ -24,7 +25,10 @@ const totalInput = ref('')
 const error = ref('')
 const generating = ref(false)
 const actionError = ref('')
+const actionSuccess = ref('')
 const remindingChargeID = ref('')
+const reminderQueue = ref<Charge[]>([])
+const reminderIndex = ref(0)
 
 onMounted(async () => {
   await Promise.all([load(), loadDefaults()])
@@ -60,6 +64,10 @@ const individualCents = computed(() =>
 
 const paidCount = computed(() => charges.value.filter((c) => c.status === 'paid' || c.status === 'manual_paid').length)
 const pendingCount = computed(() => charges.value.filter((c) => c.status === 'pending' || c.status === 'overdue').length)
+const chargesAwaitingPayment = computed(() =>
+  charges.value.filter((charge) => charge.status === 'pending' || charge.status === 'overdue'),
+)
+const currentReminder = computed(() => reminderQueue.value[reminderIndex.value] ?? null)
 const collected = computed(() =>
   charges.value
     .filter((c) => c.status === 'paid' || c.status === 'manual_paid')
@@ -98,21 +106,41 @@ async function markPaid(charge: Charge) {
 
 async function sendWhatsAppReminder(charge: Charge) {
   actionError.value = ''
+  actionSuccess.value = ''
   remindingChargeID.value = charge.id
   try {
-    const { data } = await api.post<{ url: string }>(`/admin/charges/${charge.id}/whatsapp-reminder`)
-    const url = safeUrl(data.url)
-    if (!url) {
-      actionError.value = 'Link de lembrete inválido.'
-      return
-    }
-    window.open(url, '_blank', 'noopener')
+    const { data } = await api.post<{ message: string; provider_message_id: string }>(
+      `/admin/charges/${charge.id}/whatsapp-send`,
+    )
+    actionSuccess.value = `Lembrete enviado com sucesso para ${charge.user_name.split(' ')[0]}.`
     menuFor.value = ''
+    // eslint-disable-next-line no-console
+    console.log('WhatsApp message sent:', data.message, data.provider_message_id)
   } catch (e) {
     actionError.value = errorMessage(e)
   } finally {
     remindingChargeID.value = ''
   }
+}
+
+function startWhatsAppReminders() {
+  actionError.value = ''
+  actionSuccess.value = ''
+  reminderQueue.value = chargesAwaitingPayment.value
+  reminderIndex.value = 0
+}
+
+function closeWhatsAppReminders() {
+  reminderQueue.value = []
+  reminderIndex.value = 0
+}
+
+async function openNextWhatsAppReminder() {
+  const charge = currentReminder.value
+  if (!charge) return
+
+  await sendWhatsAppReminder(charge)
+  if (!actionError.value) reminderIndex.value += 1
 }
 
 async function exempt(charge: Charge) {
@@ -251,7 +279,7 @@ const monthOptions = computed(() => {
             Gerar {{ activeUsers }} cobranças
           </BaseButton>
           <p class="mt-2.5 text-[11.5px] leading-relaxed text-ink3">
-            O vencimento é calculado automaticamente no 5º dia útil. Os lembretes são enviados manualmente pelo WhatsApp, sem custo ou QR Code.
+            O vencimento é calculado automaticamente no 5º dia útil. Os lembretes são enviados pelo WhatsApp automaticamente pelo sistema.
           </p>
         </Card>
       </div>
@@ -266,9 +294,21 @@ const monthOptions = computed(() => {
           </select>
           <Badge tone="success">{{ paidCount }} pagas</Badge>
           <Badge tone="warn">{{ pendingCount }} aguardando</Badge>
+          <BaseButton
+            v-if="chargesAwaitingPayment.length"
+            variant="outline"
+            size="sm"
+            class="ml-auto"
+            @click="startWhatsAppReminders"
+          >
+            Enviar {{ chargesAwaitingPayment.length }} lembretes
+          </BaseButton>
         </div>
         <p v-if="actionError" class="border-b border-danger/20 bg-dangerBg px-5 py-3 text-[13px] font-medium text-danger">
           {{ actionError }}
+        </p>
+        <p v-if="actionSuccess" class="border-b border-brand/20 bg-brandSoft px-5 py-3 text-[13px] font-medium text-brandInk">
+          {{ actionSuccess }}
         </p>
 
         <div class="overflow-x-auto">
@@ -325,7 +365,7 @@ const monthOptions = computed(() => {
                       :disabled="remindingChargeID === charge.id"
                       @click="sendWhatsAppReminder(charge)"
                     >
-                      {{ remindingChargeID === charge.id ? 'Abrindo...' : 'WhatsApp' }}
+                      {{ remindingChargeID === charge.id ? 'Enviando...' : 'Enviar lembrete' }}
                     </button>
                     <button type="button" class="text-[12.5px] font-semibold text-brand" @click="markPaid(charge)">
                       Registrar pagamento
@@ -374,6 +414,41 @@ const monthOptions = computed(() => {
         </div>
       </Card>
     </div>
+
+    <Modal
+      :open="reminderQueue.length > 0"
+      title="Lembretes de pagamento"
+      @close="closeWhatsAppReminders"
+    >
+      <template v-if="currentReminder">
+        <p class="text-sm leading-relaxed text-ink2">
+          {{ reminderIndex + 1 }} de {{ reminderQueue.length }}: enviar lembrete para
+          <strong class="text-ink">{{ currentReminder.user_name }}</strong>.
+        </p>
+        <p class="mt-2 text-xs leading-relaxed text-ink3">
+          A mensagem é disparada automaticamente pelo sistema via WhatsApp.
+        </p>
+        <p v-if="actionError" class="mt-3 rounded-xl bg-dangerBg px-3 py-2.5 text-[13px] font-medium text-danger">
+          {{ actionError }}
+        </p>
+        <p v-if="actionSuccess" class="mt-3 rounded-xl bg-brandSoft px-3 py-2.5 text-[13px] font-medium text-brandInk">
+          {{ actionSuccess }}
+        </p>
+        <BaseButton
+          class="mt-5 w-full"
+          :loading="remindingChargeID === currentReminder.id"
+          @click="openNextWhatsAppReminder"
+        >
+          Enviar lembrete de {{ currentReminder.user_name.split(' ')[0] }}
+        </BaseButton>
+      </template>
+      <template v-else>
+        <p class="text-sm leading-relaxed text-ink2">
+          Todos os {{ reminderQueue.length }} lembretes foram enviados.
+        </p>
+        <BaseButton class="mt-5 w-full" @click="closeWhatsAppReminders">Concluir</BaseButton>
+      </template>
+    </Modal>
   </AdminLayout>
 </template>
 
